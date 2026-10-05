@@ -181,9 +181,44 @@ class OdooClient:
         self._issue_type_id_cache = {}
         self._user_cache = {}  # { identifier: user_id }
         self._stage_id_cache = {}  # { 'project_id_stage_name': stage_id }
+        self._partner_cache = {}  # { user_id: partner_id }
 
     def _execute(self, model, method, *args, **kwargs):
         return self.models.execute_kw(ODOO_DB, self.uid, ODOO_API_KEY, model, method, list(args), kwargs)
+
+    def get_partner_id(self, user_id: int) -> int | None:
+        if not user_id:
+            return None
+        if user_id in self._partner_cache:
+            return self._partner_cache[user_id]
+        try:
+            users = self._execute("res.users", "read", [user_id], fields=["partner_id"])
+            if users and users[0].get("partner_id"):
+                partner_id = users[0]["partner_id"][0]
+                self._partner_cache[user_id] = partner_id
+                return partner_id
+        except Exception as e:
+            log.warning("Failed to look up partner for user %s: %s", user_id, e)
+        return None
+
+    def notify_assignee(self, task_id: int, assignee_id: int, task_name: str):
+        partner_id = self.get_partner_id(assignee_id)
+        if not partner_id:
+            return
+            
+        body = f"<p>Hello,</p><p>You have been assigned to a new Kraken ticket: <b>{task_name}</b>.</p><p>Please review it in your Odoo tasks.</p>"
+        try:
+            self._execute(
+                "project.task", "message_post", [task_id],
+                body=body,
+                subject=f"Assigned: {task_name}",
+                message_type="comment",
+                subtype_xmlid="mail.mt_comment",
+                partner_ids=[partner_id]
+            )
+            log.info("Sent email notification to assignee (partner %s) for task %s", partner_id, task_id)
+        except Exception as e:
+            log.error("Failed to send email notification for task %s: %s", task_id, e)
 
     def get_stage_id(self, project_id: int, stage_name: str) -> int | None:
         """Dynamically look up stage ID by name within a specific project."""
@@ -427,6 +462,10 @@ def run():
                 new_task_id = odoo.create_task(odoo_fields)
                 save_mapping(conn, kraken_id, new_task_id, status)
                 log.info("Created Odoo task %s for ticket %s", new_task_id, kraken_id)
+                
+                # Send email notification via Odoo's message_post if an assignee exists
+                if "x_assignee_id" in odoo_fields:
+                    odoo.notify_assignee(new_task_id, odoo_fields["x_assignee_id"], odoo_fields.get("name", "New Ticket"))
 
         except Exception as e:
             log.exception("Failed to process message at offset %s", message.offset)
